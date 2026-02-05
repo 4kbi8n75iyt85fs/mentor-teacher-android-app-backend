@@ -87,6 +87,16 @@ func main() {
 
 		// Chapters lookup
 		api.GET("/chapters", getChapters)
+
+		// Transactions & Analytics endpoints
+		api.GET("/transactions", getTransactions)
+		api.POST("/transactions", createTransaction)
+		api.DELETE("/transactions/:id", deleteTransaction)
+		api.GET("/analytics/monthly", getMonthlyAnalytics)
+
+		// Attendance endpoints
+		api.POST("/attendance", recordAttendance)
+		api.GET("/attendance/:teacherId", getAttendanceHistory)
 	}
 
 	r.GET("/health", func(c *gin.Context) {
@@ -1233,3 +1243,315 @@ func deleteContent(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Content deleted"})
 }
+
+// ============================================
+// TRANSACTIONS (Cash Flow)
+// ============================================
+func getTransactions(c *gin.Context) {
+	year := c.Query("year")
+	month := c.Query("month")
+
+	query := `
+		SELECT id, date, type, amount, description, category, subscription_id, created_at
+		FROM mentor.transactions
+		WHERE 1=1
+	`
+	args := []interface{}{}
+	argNum := 1
+
+	if year != "" && month != "" {
+		query += fmt.Sprintf(" AND EXTRACT(YEAR FROM date) = $%d AND EXTRACT(MONTH FROM date) = $%d", argNum, argNum+1)
+		args = append(args, year, month)
+		argNum += 2
+	}
+
+	query += " ORDER BY date DESC, created_at DESC"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var transactions []gin.H
+	for rows.Next() {
+		var id int
+		var date, txType, description, category string
+		var amount float64
+		var subscriptionId sql.NullInt64
+		var createdAt time.Time
+		var categoryNull, descNull sql.NullString
+
+		rows.Scan(&id, &date, &txType, &amount, &descNull, &categoryNull, &subscriptionId, &createdAt)
+
+		if descNull.Valid {
+			description = descNull.String
+		}
+		if categoryNull.Valid {
+			category = categoryNull.String
+		}
+
+		tx := gin.H{
+			"id":          id,
+			"date":        date,
+			"type":        txType,
+			"amount":      amount,
+			"description": description,
+			"category":    category,
+			"created_at":  createdAt.Format("2006-01-02 15:04"),
+		}
+		if subscriptionId.Valid {
+			tx["subscription_id"] = subscriptionId.Int64
+		}
+		transactions = append(transactions, tx)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "transactions": transactions})
+}
+
+func createTransaction(c *gin.Context) {
+	var input struct {
+		Date           string  `json:"date"`
+		Type           string  `json:"type"` // "income" or "expense"
+		Amount         float64 `json:"amount"`
+		Description    string  `json:"description"`
+		Category       string  `json:"category"` // "student_fee", "teacher_salary", "rent", "materials", "other"
+		SubscriptionID *int    `json:"subscription_id"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+
+	if input.Date == "" || input.Type == "" || input.Amount == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "date, type, and amount are required"})
+		return
+	}
+
+	var id int
+	err := db.QueryRow(`
+		INSERT INTO mentor.transactions (date, type, amount, description, category, subscription_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id
+	`, input.Date, input.Type, input.Amount, input.Description, input.Category, input.SubscriptionID).Scan(&id)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "id": id, "message": "Transaction created"})
+}
+
+func deleteTransaction(c *gin.Context) {
+	id := c.Param("id")
+
+	_, err := db.Exec("DELETE FROM mentor.transactions WHERE id = $1", id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Transaction deleted"})
+}
+
+func getMonthlyAnalytics(c *gin.Context) {
+	year := c.Query("year")
+	month := c.Query("month")
+
+	if year == "" || month == "" {
+		now := time.Now()
+		year = strconv.Itoa(now.Year())
+		month = strconv.Itoa(int(now.Month()))
+	}
+
+	// Get total income
+	var totalIncome float64
+	db.QueryRow(`
+		SELECT COALESCE(SUM(amount), 0) FROM mentor.transactions 
+		WHERE type = 'income' AND EXTRACT(YEAR FROM date) = $1 AND EXTRACT(MONTH FROM date) = $2
+	`, year, month).Scan(&totalIncome)
+
+	// Get total expenses
+	var totalExpenses float64
+	db.QueryRow(`
+		SELECT COALESCE(SUM(amount), 0) FROM mentor.transactions 
+		WHERE type = 'expense' AND EXTRACT(YEAR FROM date) = $1 AND EXTRACT(MONTH FROM date) = $2
+	`, year, month).Scan(&totalExpenses)
+
+	// Get breakdown by category
+	categoryRows, _ := db.Query(`
+		SELECT category, type, SUM(amount) as total
+		FROM mentor.transactions 
+		WHERE EXTRACT(YEAR FROM date) = $1 AND EXTRACT(MONTH FROM date) = $2
+		GROUP BY category, type
+		ORDER BY total DESC
+	`, year, month)
+	defer categoryRows.Close()
+
+	var categoryBreakdown []gin.H
+	for categoryRows.Next() {
+		var category, txType string
+		var total float64
+		var catNull sql.NullString
+		categoryRows.Scan(&catNull, &txType, &total)
+		if catNull.Valid {
+			category = catNull.String
+		} else {
+			category = "uncategorized"
+		}
+		categoryBreakdown = append(categoryBreakdown, gin.H{
+			"category": category,
+			"type":     txType,
+			"total":    total,
+		})
+	}
+
+	// Get daily breakdown for calendar view
+	dailyRows, _ := db.Query(`
+		SELECT date, type, SUM(amount) as total
+		FROM mentor.transactions 
+		WHERE EXTRACT(YEAR FROM date) = $1 AND EXTRACT(MONTH FROM date) = $2
+		GROUP BY date, type
+		ORDER BY date
+	`, year, month)
+	defer dailyRows.Close()
+
+	dailyData := make(map[string]gin.H)
+	for dailyRows.Next() {
+		var date, txType string
+		var total float64
+		dailyRows.Scan(&date, &txType, &total)
+
+		if _, exists := dailyData[date]; !exists {
+			dailyData[date] = gin.H{"date": date, "income": 0.0, "expense": 0.0}
+		}
+		dailyData[date][txType] = total
+	}
+
+	var dailyList []gin.H
+	for _, v := range dailyData {
+		dailyList = append(dailyList, v)
+	}
+
+	// Get student count and active subscriptions
+	var activeStudents int
+	db.QueryRow("SELECT COUNT(*) FROM mentor.subscriptions WHERE status = 'active'").Scan(&activeStudents)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":       true,
+		"year":          year,
+		"month":         month,
+		"total_income":  totalIncome,
+		"total_expense": totalExpenses,
+		"profit":        totalIncome - totalExpenses,
+		"categories":    categoryBreakdown,
+		"daily":         dailyList,
+		"active_students": activeStudents,
+	})
+}
+
+// ============================================
+// ATTENDANCE (GPS Proof)
+// ============================================
+func recordAttendance(c *gin.Context) {
+	var input struct {
+		TeacherID      string  `json:"teacher_id"`
+		SubscriptionID int     `json:"subscription_id"`
+		Latitude       float64 `json:"latitude"`
+		Longitude      float64 `json:"longitude"`
+		Action         string  `json:"action"` // "start" or "end"
+		Notes          string  `json:"notes"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+
+	var id int
+	err := db.QueryRow(`
+		INSERT INTO mentor.attendance (teacher_id, subscription_id, latitude, longitude, action, notes)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id
+	`, input.TeacherID, input.SubscriptionID, input.Latitude, input.Longitude, input.Action, input.Notes).Scan(&id)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":   true,
+		"id":        id,
+		"message":   "Attendance recorded",
+		"timestamp": time.Now().Format("2006-01-02 15:04:05"),
+	})
+}
+
+func getAttendanceHistory(c *gin.Context) {
+	teacherId := c.Param("teacherId")
+	dateFrom := c.Query("from")
+	dateTo := c.Query("to")
+
+	query := `
+		SELECT a.id, a.subscription_id, s.student_name, a.latitude, a.longitude, 
+		       a.action, a.notes, a.recorded_at
+		FROM mentor.attendance a
+		LEFT JOIN mentor.subscriptions s ON a.subscription_id = s.id
+		WHERE a.teacher_id = $1
+	`
+	args := []interface{}{teacherId}
+
+	if dateFrom != "" {
+		query += " AND DATE(a.recorded_at) >= $2"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		query += fmt.Sprintf(" AND DATE(a.recorded_at) <= $%d", len(args)+1)
+		args = append(args, dateTo)
+	}
+
+	query += " ORDER BY a.recorded_at DESC LIMIT 100"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var records []gin.H
+	for rows.Next() {
+		var id, subscriptionId int
+		var studentName, action, notes string
+		var latitude, longitude float64
+		var recordedAt time.Time
+		var studentNameNull, notesNull sql.NullString
+
+		rows.Scan(&id, &subscriptionId, &studentNameNull, &latitude, &longitude, &action, &notesNull, &recordedAt)
+
+		if studentNameNull.Valid {
+			studentName = studentNameNull.String
+		}
+		if notesNull.Valid {
+			notes = notesNull.String
+		}
+
+		records = append(records, gin.H{
+			"id":              id,
+			"subscription_id": subscriptionId,
+			"student_name":    studentName,
+			"latitude":        latitude,
+			"longitude":       longitude,
+			"action":          action,
+			"notes":           notes,
+			"recorded_at":     recordedAt.Format("2006-01-02 15:04"),
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "attendance": records})
+}
+
