@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -97,6 +99,12 @@ func main() {
 		// Attendance endpoints
 		api.POST("/attendance", recordAttendance)
 		api.GET("/attendance/:teacherId", getAttendanceHistory)
+
+		// AI Exam Grading endpoints
+		api.POST("/exam/submit", submitExamForGrading)
+		api.GET("/exam/submissions", getExamSubmissions)
+		api.GET("/exam/submissions/:id", getExamSubmission)
+		api.PUT("/exam/submissions/:id/review", reviewExamSubmission)
 	}
 
 	r.GET("/health", func(c *gin.Context) {
@@ -1562,4 +1570,339 @@ func getAttendanceHistory(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "attendance": records})
 }
 
+// ============================================
+// AI EXAM GRADING (Gemini 1.5 Flash)
+// ============================================
 
+var geminiAPIKey = os.Getenv("GEMINI_API_KEY")
+
+func submitExamForGrading(c *gin.Context) {
+	var input struct {
+		SubscriptionID int    `json:"subscription_id"`
+		TeacherID      string `json:"teacher_id"`
+		StudentName    string `json:"student_name"`
+		Class          int    `json:"class"`
+		Subject        string `json:"subject"`
+		ChapterNumber  int    `json:"chapter_number"`
+		QuestionText   string `json:"question_text"`
+		ImageBase64    string `json:"image_base64"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if input.ImageBase64 == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Image is required"})
+		return
+	}
+
+	// Call Gemini API for AI grading
+	score, feedback, suggestions, err := gradeWithGemini(input.QuestionText, input.ImageBase64, input.Subject)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "AI grading failed: " + err.Error()})
+		return
+	}
+
+	// Store in database
+	var submissionID int
+	err = db.QueryRow(`
+		INSERT INTO mentor.exam_submissions 
+		(subscription_id, teacher_id, student_name, class, subject, chapter_number, question_text, image_data, ai_score, ai_feedback, ai_suggestions, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'graded')
+		RETURNING id
+	`, input.SubscriptionID, input.TeacherID, input.StudentName, input.Class, input.Subject, 
+	   input.ChapterNumber, input.QuestionText, input.ImageBase64, score, feedback, suggestions).Scan(&submissionID)
+
+	if err != nil {
+		// Table might not exist, create it
+		_, createErr := db.Exec(`
+			CREATE TABLE IF NOT EXISTS mentor.exam_submissions (
+				id SERIAL PRIMARY KEY,
+				subscription_id INTEGER,
+				teacher_id VARCHAR(50) NOT NULL,
+				student_name VARCHAR(255) NOT NULL,
+				class INTEGER NOT NULL,
+				subject VARCHAR(255) NOT NULL,
+				chapter_number INTEGER,
+				question_text TEXT,
+				image_data TEXT,
+				ai_score INTEGER,
+				ai_feedback TEXT,
+				ai_suggestions TEXT,
+				teacher_notes TEXT,
+				status VARCHAR(50) DEFAULT 'pending',
+				created_at TIMESTAMP DEFAULT NOW(),
+				updated_at TIMESTAMP DEFAULT NOW()
+			)
+		`)
+		if createErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		
+		// Retry insert
+		err = db.QueryRow(`
+			INSERT INTO mentor.exam_submissions 
+			(subscription_id, teacher_id, student_name, class, subject, chapter_number, question_text, image_data, ai_score, ai_feedback, ai_suggestions, status)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'graded')
+			RETURNING id
+		`, input.SubscriptionID, input.TeacherID, input.StudentName, input.Class, input.Subject, 
+		   input.ChapterNumber, input.QuestionText, input.ImageBase64, score, feedback, suggestions).Scan(&submissionID)
+		
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":       true,
+		"submission_id": submissionID,
+		"score":         score,
+		"feedback":      feedback,
+		"suggestions":   suggestions,
+	})
+}
+
+func gradeWithGemini(questionText, imageBase64, subject string) (int, string, string, error) {
+	if geminiAPIKey == "" {
+		return 0, "", "", fmt.Errorf("GEMINI_API_KEY not configured")
+	}
+
+	// Prepare prompt for grading
+	prompt := fmt.Sprintf(`You are an expert teacher grading a student's answer paper for the subject: %s
+
+Please analyze this handwritten answer paper image and provide:
+1. A score from 0 to 100
+2. Feedback on what the student did well
+3. Specific suggestions for improvement
+
+%s
+
+IMPORTANT: Respond in this exact JSON format:
+{
+  "score": <number 0-100>,
+  "feedback": "<what was done well>",
+  "suggestions": "<specific improvement suggestions>"
+}`, subject, func() string {
+		if questionText != "" {
+			return fmt.Sprintf("The question being answered was: %s", questionText)
+		}
+		return "No specific question was provided, evaluate the answer based on the content visible."
+	}())
+
+	// Call Gemini API
+	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + geminiAPIKey
+
+	requestBody := map[string]interface{}{
+		"contents": []map[string]interface{}{
+			{
+				"parts": []map[string]interface{}{
+					{"text": prompt},
+					{
+						"inline_data": map[string]string{
+							"mime_type": "image/jpeg",
+							"data":      imageBase64,
+						},
+					},
+				},
+			},
+		},
+		"generationConfig": map[string]interface{}{
+			"temperature": 0.2,
+			"maxOutputTokens": 1024,
+		},
+	}
+
+	jsonBody, _ := json.Marshal(requestBody)
+	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return 0, "", "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		return 0, "", "", fmt.Errorf("Gemini API error: %s", string(body))
+	}
+
+	// Parse Gemini response
+	var geminiResp struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+	}
+	json.Unmarshal(body, &geminiResp)
+
+	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+		return 0, "", "", fmt.Errorf("empty response from Gemini")
+	}
+
+	responseText := geminiResp.Candidates[0].Content.Parts[0].Text
+
+	// Extract JSON from response (handle markdown code blocks)
+	jsonStart := strings.Index(responseText, "{")
+	jsonEnd := strings.LastIndex(responseText, "}")
+	if jsonStart == -1 || jsonEnd == -1 {
+		return 0, "", "", fmt.Errorf("could not parse Gemini response")
+	}
+	jsonStr := responseText[jsonStart : jsonEnd+1]
+
+	var gradeResult struct {
+		Score       int    `json:"score"`
+		Feedback    string `json:"feedback"`
+		Suggestions string `json:"suggestions"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &gradeResult); err != nil {
+		return 0, "", "", fmt.Errorf("invalid JSON from Gemini: %s", jsonStr)
+	}
+
+	return gradeResult.Score, gradeResult.Feedback, gradeResult.Suggestions, nil
+}
+
+func getExamSubmissions(c *gin.Context) {
+	teacherID := c.Query("teacher_id")
+	studentName := c.Query("student_name")
+
+	query := `
+		SELECT id, subscription_id, teacher_id, student_name, class, subject, chapter_number, 
+		       ai_score, ai_feedback, ai_suggestions, teacher_notes, status, created_at
+		FROM mentor.exam_submissions
+		WHERE 1=1
+	`
+	args := []interface{}{}
+	argNum := 1
+
+	if teacherID != "" {
+		query += fmt.Sprintf(" AND teacher_id = $%d", argNum)
+		args = append(args, teacherID)
+		argNum++
+	}
+	if studentName != "" {
+		query += fmt.Sprintf(" AND student_name ILIKE $%d", argNum)
+		args = append(args, "%"+studentName+"%")
+		argNum++
+	}
+
+	query += " ORDER BY created_at DESC LIMIT 100"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": true, "submissions": []interface{}{}})
+		return
+	}
+	defer rows.Close()
+
+	var submissions []gin.H
+	for rows.Next() {
+		var id, subscriptionID, class, chapterNumber int
+		var aiScore sql.NullInt64
+		var teacherID, studentName, subject, status string
+		var aiFeedback, aiSuggestions, teacherNotes sql.NullString
+		var createdAt time.Time
+
+		rows.Scan(&id, &subscriptionID, &teacherID, &studentName, &class, &subject, &chapterNumber,
+			&aiScore, &aiFeedback, &aiSuggestions, &teacherNotes, &status, &createdAt)
+
+		submissions = append(submissions, gin.H{
+			"id":              id,
+			"subscription_id": subscriptionID,
+			"teacher_id":      teacherID,
+			"student_name":    studentName,
+			"class":           class,
+			"subject":         subject,
+			"chapter_number":  chapterNumber,
+			"ai_score":        aiScore.Int64,
+			"ai_feedback":     aiFeedback.String,
+			"ai_suggestions":  aiSuggestions.String,
+			"teacher_notes":   teacherNotes.String,
+			"status":          status,
+			"created_at":      createdAt.Format("2006-01-02 15:04"),
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "submissions": submissions})
+}
+
+func getExamSubmission(c *gin.Context) {
+	id := c.Param("id")
+
+	var submissionID, subscriptionID, class, chapterNumber int
+	var aiScore sql.NullInt64
+	var teacherID, studentName, subject, status string
+	var questionText, imageData, aiFeedback, aiSuggestions, teacherNotes sql.NullString
+	var createdAt time.Time
+
+	err := db.QueryRow(`
+		SELECT id, subscription_id, teacher_id, student_name, class, subject, chapter_number,
+		       question_text, image_data, ai_score, ai_feedback, ai_suggestions, teacher_notes, status, created_at
+		FROM mentor.exam_submissions WHERE id = $1
+	`, id).Scan(&submissionID, &subscriptionID, &teacherID, &studentName, &class, &subject, &chapterNumber,
+		&questionText, &imageData, &aiScore, &aiFeedback, &aiSuggestions, &teacherNotes, &status, &createdAt)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Submission not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"submission": gin.H{
+			"id":              submissionID,
+			"subscription_id": subscriptionID,
+			"teacher_id":      teacherID,
+			"student_name":    studentName,
+			"class":           class,
+			"subject":         subject,
+			"chapter_number":  chapterNumber,
+			"question_text":   questionText.String,
+			"image_data":      imageData.String,
+			"ai_score":        aiScore.Int64,
+			"ai_feedback":     aiFeedback.String,
+			"ai_suggestions":  aiSuggestions.String,
+			"teacher_notes":   teacherNotes.String,
+			"status":          status,
+			"created_at":      createdAt.Format("2006-01-02 15:04"),
+		},
+	})
+}
+
+func reviewExamSubmission(c *gin.Context) {
+	id := c.Param("id")
+
+	var input struct {
+		TeacherNotes string `json:"teacher_notes"`
+		FinalScore   *int   `json:"final_score"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	query := "UPDATE mentor.exam_submissions SET teacher_notes = $1, status = 'reviewed', updated_at = NOW()"
+	args := []interface{}{input.TeacherNotes}
+	
+	if input.FinalScore != nil {
+		query += ", ai_score = $2 WHERE id = $3"
+		args = append(args, *input.FinalScore, id)
+	} else {
+		query += " WHERE id = $2"
+		args = append(args, id)
+	}
+
+	_, err := db.Exec(query, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Submission reviewed"})
+}
