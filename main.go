@@ -1585,7 +1585,7 @@ func submitExamForGrading(c *gin.Context) {
 		SubscriptionID int    `json:"subscription_id"`
 		TeacherID      string `json:"teacher_id"`
 		StudentName    string `json:"student_name"`
-		Class          int    `json:"class"`
+		Class          string `json:"class"` // Changed to string to accept className
 		Subject        string `json:"subject"`
 		ChapterNumber  int    `json:"chapter_number"`
 		QuestionText   string `json:"question_text"`
