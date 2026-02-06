@@ -1693,8 +1693,8 @@ IMPORTANT: Respond in this exact JSON format:
 		return "No specific question was provided, evaluate the answer based on the content visible."
 	}())
 
-	// Call Gemini API
-	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + geminiAPIKey
+	// Call Gemini API - using 2.0 Flash for best free handwriting recognition
+	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + geminiAPIKey
 
 	requestBody := map[string]interface{}{
 		"contents": []map[string]interface{}{
