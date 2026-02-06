@@ -105,6 +105,10 @@ func main() {
 		api.GET("/exam/submissions", getExamSubmissions)
 		api.GET("/exam/submissions/:id", getExamSubmission)
 		api.PUT("/exam/submissions/:id/review", reviewExamSubmission)
+
+		// Answer Paper Upload endpoint (saves to database)
+		api.POST("/answer-papers/upload", uploadAnswerPaper)
+		api.GET("/answer-papers", getAnswerPapers)
 	}
 
 	r.GET("/health", func(c *gin.Context) {
@@ -1905,4 +1909,139 @@ func reviewExamSubmission(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Submission reviewed"})
+}
+
+// =====================================================
+// ANSWER PAPER UPLOAD HANDLERS (saves to database)
+// =====================================================
+
+type AnswerPaperUploadRequest struct {
+	SubscriptionID int    `json:"subscription_id"`
+	TeacherID      string `json:"teacher_id"`
+	StudentName    string `json:"student_name"`
+	ClassName      string `json:"class_name"`
+	Subject        string `json:"subject"`
+	ChapterNumber  int    `json:"chapter_number"`
+	ChapterName    string `json:"chapter_name"`
+	Images         []string `json:"images"` // Array of base64 encoded images
+	Notes          string `json:"notes"`
+}
+
+func uploadAnswerPaper(c *gin.Context) {
+	var req AnswerPaperUploadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Create table if not exists
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS mentor.answer_papers (
+			id SERIAL PRIMARY KEY,
+			subscription_id INTEGER,
+			teacher_id VARCHAR(50) NOT NULL,
+			student_name VARCHAR(255) NOT NULL,
+			class_name VARCHAR(50) NOT NULL,
+			subject VARCHAR(255) NOT NULL,
+			chapter_number INTEGER,
+			chapter_name VARCHAR(255),
+			images TEXT,
+			notes TEXT,
+			created_at TIMESTAMP DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		log.Printf("Error creating answer_papers table: %v", err)
+	}
+
+	// Store images as JSON array in database
+	imagesJSON, _ := json.Marshal(req.Images)
+
+	var paperID int
+	err = db.QueryRow(`
+		INSERT INTO mentor.answer_papers 
+		(subscription_id, teacher_id, student_name, class_name, subject, chapter_number, chapter_name, images, notes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id
+	`, req.SubscriptionID, req.TeacherID, req.StudentName, req.ClassName, req.Subject, 
+	   req.ChapterNumber, req.ChapterName, string(imagesJSON), req.Notes).Scan(&paperID)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save answer paper: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"paper_id": paperID,
+		"message": "Answer paper uploaded successfully",
+		"image_count": len(req.Images),
+	})
+}
+
+func getAnswerPapers(c *gin.Context) {
+	teacherID := c.Query("teacher_id")
+	studentName := c.Query("student_name")
+
+	query := `
+		SELECT id, subscription_id, teacher_id, student_name, class_name, subject, 
+		       chapter_number, chapter_name, notes, created_at
+		FROM mentor.answer_papers
+		WHERE 1=1
+	`
+	args := []interface{}{}
+	argCount := 0
+
+	if teacherID != "" {
+		argCount++
+		query += fmt.Sprintf(" AND teacher_id = $%d", argCount)
+		args = append(args, teacherID)
+	}
+	if studentName != "" {
+		argCount++
+		query += fmt.Sprintf(" AND student_name ILIKE $%d", argCount)
+		args = append(args, "%"+studentName+"%")
+	}
+
+	query += " ORDER BY created_at DESC LIMIT 50"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		// Table might not exist yet
+		c.JSON(http.StatusOK, gin.H{"success": true, "papers": []interface{}{}})
+		return
+	}
+	defer rows.Close()
+
+	var papers []map[string]interface{}
+	for rows.Next() {
+		var id, subscriptionID, chapterNumber int
+		var teacherID, studentName, className, subject, chapterName, notes string
+		var createdAt time.Time
+
+		err := rows.Scan(&id, &subscriptionID, &teacherID, &studentName, &className, &subject,
+			&chapterNumber, &chapterName, &notes, &createdAt)
+		if err != nil {
+			continue
+		}
+
+		papers = append(papers, map[string]interface{}{
+			"id":             id,
+			"subscription_id": subscriptionID,
+			"teacher_id":     teacherID,
+			"student_name":   studentName,
+			"class_name":     className,
+			"subject":        subject,
+			"chapter_number": chapterNumber,
+			"chapter_name":   chapterName,
+			"notes":          notes,
+			"created_at":     createdAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	if papers == nil {
+		papers = []map[string]interface{}{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "papers": papers})
 }
