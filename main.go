@@ -100,15 +100,18 @@ func main() {
 		api.POST("/attendance", recordAttendance)
 		api.GET("/attendance/:teacherId", getAttendanceHistory)
 
-		// AI Exam Grading endpoints
-		api.POST("/exam/submit", submitExamForGrading)
-		api.GET("/exam/submissions", getExamSubmissions)
-		api.GET("/exam/submissions/:id", getExamSubmission)
-		api.PUT("/exam/submissions/:id/review", reviewExamSubmission)
-
-		// Answer Paper Upload endpoint (saves to database)
-		api.POST("/answer-papers/upload", uploadAnswerPaper)
-		api.GET("/answer-papers", getAnswerPapers)
+		// Manual Grading System (ImgBB + Admin Review)
+		api.POST("/upload/image", uploadToImgBB)              // Upload image to ImgBB
+		api.POST("/answer-papers/submit", submitAnswerPaper)  // Teacher submits paper
+		api.GET("/answer-papers", getAnswerPapers)            // List answer papers
+		api.GET("/answer-papers/:id", getAnswerPaper)         // Get single paper
+		
+		// Admin Grading
+		api.GET("/admin/grading", getGradingQueue)            // Papers pending grading
+		api.POST("/admin/grading/:id", saveGrade)             // Admin saves grade
+		
+		// Teacher Grades History  
+		api.GET("/teacher/grades/:teacherId", getTeacherGrades)
 	}
 
 	r.GET("/health", func(c *gin.Context) {
@@ -1574,22 +1577,15 @@ func getAttendanceHistory(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "attendance": records})
 }
 
-// ============================================
-// AI EXAM GRADING (Gemini 1.5 Flash)
-// ============================================
+// =====================================================
+// MANUAL GRADING SYSTEM (ImgBB + Admin Review)
+// =====================================================
 
-var geminiAPIKey = os.Getenv("GEMINI_API_KEY")
-
-func submitExamForGrading(c *gin.Context) {
+// uploadToImgBB uploads an image to ImgBB and returns the URL
+func uploadToImgBB(c *gin.Context) {
 	var input struct {
-		SubscriptionID int    `json:"subscription_id"`
-		TeacherID      string `json:"teacher_id"`
-		StudentName    string `json:"student_name"`
-		Class          string `json:"class"` // Changed to string to accept className
-		Subject        string `json:"subject"`
-		ChapterNumber  int    `json:"chapter_number"`
-		QuestionText   string `json:"question_text"`
-		ImageBase64    string `json:"image_base64"`
+		Image string `json:"image"` // Base64 encoded image
+		Name  string `json:"name"`  // Optional image name
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1597,408 +1593,65 @@ func submitExamForGrading(c *gin.Context) {
 		return
 	}
 
-	if input.ImageBase64 == "" {
+	if input.Image == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Image is required"})
 		return
 	}
 
-	// Call Gemini API for AI grading
-	score, feedback, suggestions, err := gradeWithGemini(input.QuestionText, input.ImageBase64, input.Subject)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "AI grading failed: " + err.Error()})
+	imgbbKey := os.Getenv("IMGBB_API_KEY")
+	if imgbbKey == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "IMGBB_API_KEY not configured"})
 		return
 	}
 
-	// Store in database
-	var submissionID int
-	err = db.QueryRow(`
-		INSERT INTO mentor.exam_submissions 
-		(subscription_id, teacher_id, student_name, class, subject, chapter_number, question_text, image_data, ai_score, ai_feedback, ai_suggestions, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'graded')
-		RETURNING id
-	`, input.SubscriptionID, input.TeacherID, input.StudentName, input.Class, input.Subject, 
-	   input.ChapterNumber, input.QuestionText, input.ImageBase64, score, feedback, suggestions).Scan(&submissionID)
-
-	if err != nil {
-		// Table might not exist, create it
-		_, createErr := db.Exec(`
-			CREATE TABLE IF NOT EXISTS mentor.exam_submissions (
-				id SERIAL PRIMARY KEY,
-				subscription_id INTEGER,
-				teacher_id VARCHAR(50) NOT NULL,
-				student_name VARCHAR(255) NOT NULL,
-				class INTEGER NOT NULL,
-				subject VARCHAR(255) NOT NULL,
-				chapter_number INTEGER,
-				question_text TEXT,
-				image_data TEXT,
-				ai_score INTEGER,
-				ai_feedback TEXT,
-				ai_suggestions TEXT,
-				teacher_notes TEXT,
-				status VARCHAR(50) DEFAULT 'pending',
-				created_at TIMESTAMP DEFAULT NOW(),
-				updated_at TIMESTAMP DEFAULT NOW()
-			)
-		`)
-		if createErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		
-		// Retry insert
-		err = db.QueryRow(`
-			INSERT INTO mentor.exam_submissions 
-			(subscription_id, teacher_id, student_name, class, subject, chapter_number, question_text, image_data, ai_score, ai_feedback, ai_suggestions, status)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'graded')
-			RETURNING id
-		`, input.SubscriptionID, input.TeacherID, input.StudentName, input.Class, input.Subject, 
-		   input.ChapterNumber, input.QuestionText, input.ImageBase64, score, feedback, suggestions).Scan(&submissionID)
-		
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success":       true,
-		"submission_id": submissionID,
-		"score":         score,
-		"feedback":      feedback,
-		"suggestions":   suggestions,
+	// Upload to ImgBB
+	resp, err := http.PostForm("https://api.imgbb.com/1/upload", map[string][]string{
+		"key":   {imgbbKey},
+		"image": {input.Image},
+		"name":  {input.Name},
 	})
-}
-
-func gradeWithGemini(questionText, imageBase64, subject string) (int, string, string, error) {
-	// Use Groq API with llama-3.2-vision for better rate limits (30 req/min FREE)
-	groqAPIKey := os.Getenv("GROQ_API_KEY")
-	
-	// Fallback to Gemini if Groq not configured
-	if groqAPIKey == "" {
-		return gradeWithGeminiDirect(questionText, imageBase64, subject)
-	}
-
-	// Prepare prompt for grading
-	prompt := fmt.Sprintf(`You are an expert teacher grading a student's answer paper for the subject: %s
-
-Please analyze this handwritten answer paper image and provide:
-1. A score from 0 to 100
-2. Feedback on what the student did well
-3. Specific suggestions for improvement
-
-%s
-
-IMPORTANT: Respond in this exact JSON format only:
-{
-  "score": <number 0-100>,
-  "feedback": "<what was done well>",
-  "suggestions": "<specific improvement suggestions>"
-}`, subject, func() string {
-		if questionText != "" {
-			return fmt.Sprintf("The question being answered was: %s", questionText)
-		}
-		return "No specific question was provided, evaluate the answer based on the content visible."
-	}())
-
-	// Call Groq API with llama-3.2-90b-vision-preview
-	apiURL := "https://api.groq.com/openai/v1/chat/completions"
-
-	requestBody := map[string]interface{}{
-		"model": "llama-3.2-90b-vision-preview",
-		"messages": []map[string]interface{}{
-			{
-				"role": "user",
-				"content": []map[string]interface{}{
-					{"type": "text", "text": prompt},
-					{
-						"type": "image_url",
-						"image_url": map[string]string{
-							"url": "data:image/jpeg;base64," + imageBase64,
-						},
-					},
-				},
-			},
-		},
-		"temperature": 0.2,
-		"max_tokens":  1024,
-	}
-
-	jsonBody, _ := json.Marshal(requestBody)
-	
-	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return 0, "", "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+groqAPIKey)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, "", "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != 200 {
-		// If Groq fails, try Gemini as fallback
-		log.Printf("Groq API error: %s, falling back to Gemini", string(body))
-		return gradeWithGeminiDirect(questionText, imageBase64, subject)
-	}
-
-	// Parse Groq/OpenAI response format
-	var groqResp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	json.Unmarshal(body, &groqResp)
-
-	if len(groqResp.Choices) == 0 {
-		return 0, "", "", fmt.Errorf("empty response from Groq")
-	}
-
-	responseText := groqResp.Choices[0].Message.Content
-
-	// Extract JSON from response (handle markdown code blocks)
-	jsonStart := strings.Index(responseText, "{")
-	jsonEnd := strings.LastIndex(responseText, "}")
-	if jsonStart == -1 || jsonEnd == -1 {
-		return 0, "", "", fmt.Errorf("could not parse Groq response: %s", responseText)
-	}
-	jsonStr := responseText[jsonStart : jsonEnd+1]
-
-	var gradeResult struct {
-		Score       int    `json:"score"`
-		Feedback    string `json:"feedback"`
-		Suggestions string `json:"suggestions"`
-	}
-	if err := json.Unmarshal([]byte(jsonStr), &gradeResult); err != nil {
-		return 0, "", "", fmt.Errorf("invalid JSON from Groq: %s", jsonStr)
-	}
-
-	return gradeResult.Score, gradeResult.Feedback, gradeResult.Suggestions, nil
-}
-
-// gradeWithGeminiDirect - fallback to Gemini if Groq not configured
-func gradeWithGeminiDirect(questionText, imageBase64, subject string) (int, string, string, error) {
-	if geminiAPIKey == "" {
-		return 0, "", "", fmt.Errorf("No AI API key configured (GROQ_API_KEY or GEMINI_API_KEY required)")
-	}
-
-	// Prepare prompt for grading
-	prompt := fmt.Sprintf(`You are an expert teacher grading a student's answer paper for the subject: %s
-
-Please analyze this handwritten answer paper image and provide:
-1. A score from 0 to 100
-2. Feedback on what the student did well
-3. Specific suggestions for improvement
-
-%s
-
-IMPORTANT: Respond in this exact JSON format only:
-{
-  "score": <number 0-100>,
-  "feedback": "<what was done well>",
-  "suggestions": "<specific improvement suggestions>"
-}`, subject, func() string {
-		if questionText != "" {
-			return fmt.Sprintf("The question being answered was: %s", questionText)
-		}
-		return "No specific question was provided, evaluate the answer based on the content visible."
-	}())
-
-	// Call Gemini API
-	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + geminiAPIKey
-
-	requestBody := map[string]interface{}{
-		"contents": []map[string]interface{}{
-			{
-				"parts": []map[string]interface{}{
-					{"text": prompt},
-					{
-						"inline_data": map[string]string{
-							"mime_type": "image/jpeg",
-							"data":      imageBase64,
-						},
-					},
-				},
-			},
-		},
-		"generationConfig": map[string]interface{}{
-			"temperature":     0.2,
-			"maxOutputTokens": 1024,
-		},
-	}
-
-	jsonBody, _ := json.Marshal(requestBody)
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return 0, "", "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != 200 {
-		return 0, "", "", fmt.Errorf("Gemini API error: %s", string(body))
-	}
-
-	// Parse Gemini response
-	var geminiResp struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
-	}
-	json.Unmarshal(body, &geminiResp)
-
-	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
-		return 0, "", "", fmt.Errorf("empty response from Gemini")
-	}
-
-	responseText := geminiResp.Candidates[0].Content.Parts[0].Text
-
-	// Extract JSON from response (handle markdown code blocks)
-	jsonStart := strings.Index(responseText, "{")
-	jsonEnd := strings.LastIndex(responseText, "}")
-	if jsonStart == -1 || jsonEnd == -1 {
-		return 0, "", "", fmt.Errorf("could not parse Gemini response")
-	}
-	jsonStr := responseText[jsonStart : jsonEnd+1]
-
-	var gradeResult struct {
-		Score       int    `json:"score"`
-		Feedback    string `json:"feedback"`
-		Suggestions string `json:"suggestions"`
-	}
-	if err := json.Unmarshal([]byte(jsonStr), &gradeResult); err != nil {
-		return 0, "", "", fmt.Errorf("invalid JSON from Gemini: %s", jsonStr)
-	}
-
-	return gradeResult.Score, gradeResult.Feedback, gradeResult.Suggestions, nil
-}
-
-func getExamSubmissions(c *gin.Context) {
-	teacherID := c.Query("teacher_id")
-	studentName := c.Query("student_name")
-
-	query := `
-		SELECT id, subscription_id, teacher_id, student_name, class, subject, chapter_number, 
-		       ai_score, ai_feedback, ai_suggestions, teacher_notes, status, created_at
-		FROM mentor.exam_submissions
-		WHERE 1=1
-	`
-	args := []interface{}{}
-	argNum := 1
-
-	if teacherID != "" {
-		query += fmt.Sprintf(" AND teacher_id = $%d", argNum)
-		args = append(args, teacherID)
-		argNum++
-	}
-	if studentName != "" {
-		query += fmt.Sprintf(" AND student_name ILIKE $%d", argNum)
-		args = append(args, "%"+studentName+"%")
-		argNum++
-	}
-
-	query += " ORDER BY created_at DESC LIMIT 100"
-
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": true, "submissions": []interface{}{}})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload: " + err.Error()})
 		return
 	}
-	defer rows.Close()
+	defer resp.Body.Close()
 
-	var submissions []gin.H
-	for rows.Next() {
-		var id, subscriptionID, class, chapterNumber int
-		var aiScore sql.NullInt64
-		var teacherID, studentName, subject, status string
-		var aiFeedback, aiSuggestions, teacherNotes sql.NullString
-		var createdAt time.Time
+	body, _ := io.ReadAll(resp.Body)
 
-		rows.Scan(&id, &subscriptionID, &teacherID, &studentName, &class, &subject, &chapterNumber,
-			&aiScore, &aiFeedback, &aiSuggestions, &teacherNotes, &status, &createdAt)
-
-		submissions = append(submissions, gin.H{
-			"id":              id,
-			"subscription_id": subscriptionID,
-			"teacher_id":      teacherID,
-			"student_name":    studentName,
-			"class":           class,
-			"subject":         subject,
-			"chapter_number":  chapterNumber,
-			"ai_score":        aiScore.Int64,
-			"ai_feedback":     aiFeedback.String,
-			"ai_suggestions":  aiSuggestions.String,
-			"teacher_notes":   teacherNotes.String,
-			"status":          status,
-			"created_at":      createdAt.Format("2006-01-02 15:04"),
-		})
+	var imgbbResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			URL        string `json:"url"`
+			DisplayURL string `json:"display_url"`
+		} `json:"data"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
+	json.Unmarshal(body, &imgbbResp)
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "submissions": submissions})
-}
-
-func getExamSubmission(c *gin.Context) {
-	id := c.Param("id")
-
-	var submissionID, subscriptionID, class, chapterNumber int
-	var aiScore sql.NullInt64
-	var teacherID, studentName, subject, status string
-	var questionText, imageData, aiFeedback, aiSuggestions, teacherNotes sql.NullString
-	var createdAt time.Time
-
-	err := db.QueryRow(`
-		SELECT id, subscription_id, teacher_id, student_name, class, subject, chapter_number,
-		       question_text, image_data, ai_score, ai_feedback, ai_suggestions, teacher_notes, status, created_at
-		FROM mentor.exam_submissions WHERE id = $1
-	`, id).Scan(&submissionID, &subscriptionID, &teacherID, &studentName, &class, &subject, &chapterNumber,
-		&questionText, &imageData, &aiScore, &aiFeedback, &aiSuggestions, &teacherNotes, &status, &createdAt)
-
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Submission not found"})
+	if !imgbbResp.Success {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "ImgBB error: " + imgbbResp.Error.Message})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"submission": gin.H{
-			"id":              submissionID,
-			"subscription_id": subscriptionID,
-			"teacher_id":      teacherID,
-			"student_name":    studentName,
-			"class":           class,
-			"subject":         subject,
-			"chapter_number":  chapterNumber,
-			"question_text":   questionText.String,
-			"image_data":      imageData.String,
-			"ai_score":        aiScore.Int64,
-			"ai_feedback":     aiFeedback.String,
-			"ai_suggestions":  aiSuggestions.String,
-			"teacher_notes":   teacherNotes.String,
-			"status":          status,
-			"created_at":      createdAt.Format("2006-01-02 15:04"),
-		},
+		"url":     imgbbResp.Data.DisplayURL,
 	})
 }
 
-func reviewExamSubmission(c *gin.Context) {
-	id := c.Param("id")
-
+// submitAnswerPaper - Teacher submits answer paper for grading
+func submitAnswerPaper(c *gin.Context) {
 	var input struct {
-		TeacherNotes string `json:"teacher_notes"`
-		FinalScore   *int   `json:"final_score"`
+		SubscriptionID int      `json:"subscription_id"`
+		TeacherID      string   `json:"teacher_id"`
+		StudentName    string   `json:"student_name"`
+		ClassName      string   `json:"class_name"`
+		Subject        string   `json:"subject"`
+		ChapterNumber  int      `json:"chapter_number"`
+		ChapterName    string   `json:"chapter_name"`
+		Images         []string `json:"images"` // Base64 images
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -2006,51 +1659,46 @@ func reviewExamSubmission(c *gin.Context) {
 		return
 	}
 
-	query := "UPDATE mentor.exam_submissions SET teacher_notes = $1, status = 'reviewed', updated_at = NOW()"
-	args := []interface{}{input.TeacherNotes}
-	
-	if input.FinalScore != nil {
-		query += ", ai_score = $2 WHERE id = $3"
-		args = append(args, *input.FinalScore, id)
-	} else {
-		query += " WHERE id = $2"
-		args = append(args, id)
-	}
-
-	_, err := db.Exec(query, args...)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if len(input.Images) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "At least one image is required"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Submission reviewed"})
-}
+	// Upload images to ImgBB
+	imgbbKey := os.Getenv("IMGBB_API_KEY")
+	var imageURLs []string
 
-// =====================================================
-// ANSWER PAPER UPLOAD HANDLERS (saves to database)
-// =====================================================
+	for i, imgBase64 := range input.Images {
+		if imgbbKey != "" {
+			resp, err := http.PostForm("https://api.imgbb.com/1/upload", map[string][]string{
+				"key":   {imgbbKey},
+				"image": {imgBase64},
+				"name":  {fmt.Sprintf("%s_%s_%d", input.StudentName, input.Subject, i)},
+			})
+			if err == nil {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				var imgbbResp struct {
+					Success bool `json:"success"`
+					Data    struct {
+						DisplayURL string `json:"display_url"`
+					} `json:"data"`
+				}
+				json.Unmarshal(body, &imgbbResp)
+				if imgbbResp.Success {
+					imageURLs = append(imageURLs, imgbbResp.Data.DisplayURL)
+				}
+			}
+		}
+	}
 
-type AnswerPaperUploadRequest struct {
-	SubscriptionID int    `json:"subscription_id"`
-	TeacherID      string `json:"teacher_id"`
-	StudentName    string `json:"student_name"`
-	ClassName      string `json:"class_name"`
-	Subject        string `json:"subject"`
-	ChapterNumber  int    `json:"chapter_number"`
-	ChapterName    string `json:"chapter_name"`
-	Images         []string `json:"images"` // Array of base64 encoded images
-	Notes          string `json:"notes"`
-}
-
-func uploadAnswerPaper(c *gin.Context) {
-	var req AnswerPaperUploadRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	// If ImgBB failed, store base64 directly (fallback)
+	if len(imageURLs) == 0 {
+		imageURLs = input.Images
 	}
 
 	// Create table if not exists
-	_, err := db.Exec(`
+	_, _ = db.Exec(`
 		CREATE TABLE IF NOT EXISTS mentor.answer_papers (
 			id SERIAL PRIMARY KEY,
 			subscription_id INTEGER,
@@ -2060,47 +1708,51 @@ func uploadAnswerPaper(c *gin.Context) {
 			subject VARCHAR(255) NOT NULL,
 			chapter_number INTEGER,
 			chapter_name VARCHAR(255),
-			images TEXT,
-			notes TEXT,
+			image_urls TEXT,
+			question_text TEXT,
+			total_marks INTEGER,
+			actual_marks INTEGER,
+			admin_suggestions TEXT,
+			status VARCHAR(50) DEFAULT 'pending',
+			graded_at TIMESTAMP,
+			graded_by VARCHAR(100),
 			created_at TIMESTAMP DEFAULT NOW()
 		)
 	`)
-	if err != nil {
-		log.Printf("Error creating answer_papers table: %v", err)
-	}
 
-	// Store images as JSON array in database
-	imagesJSON, _ := json.Marshal(req.Images)
-
+	// Save to database
+	imageURLsJSON, _ := json.Marshal(imageURLs)
 	var paperID int
-	err = db.QueryRow(`
+	err := db.QueryRow(`
 		INSERT INTO mentor.answer_papers 
-		(subscription_id, teacher_id, student_name, class_name, subject, chapter_number, chapter_name, images, notes)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		(subscription_id, teacher_id, student_name, class_name, subject, chapter_number, chapter_name, image_urls, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
 		RETURNING id
-	`, req.SubscriptionID, req.TeacherID, req.StudentName, req.ClassName, req.Subject, 
-	   req.ChapterNumber, req.ChapterName, string(imagesJSON), req.Notes).Scan(&paperID)
+	`, input.SubscriptionID, input.TeacherID, input.StudentName, input.ClassName,
+		input.Subject, input.ChapterNumber, input.ChapterName, string(imageURLsJSON)).Scan(&paperID)
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save answer paper: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save: " + err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"paper_id": paperID,
-		"message": "Answer paper uploaded successfully",
-		"image_count": len(req.Images),
+		"success":    true,
+		"paper_id":   paperID,
+		"image_urls": imageURLs,
+		"message":    "Submitted for grading",
 	})
 }
 
+// getAnswerPapers - List answer papers (for admin or teacher)
 func getAnswerPapers(c *gin.Context) {
 	teacherID := c.Query("teacher_id")
-	studentName := c.Query("student_name")
+	status := c.DefaultQuery("status", "")
 
 	query := `
 		SELECT id, subscription_id, teacher_id, student_name, class_name, subject, 
-		       chapter_number, chapter_name, notes, created_at
+		       chapter_number, chapter_name, image_urls, question_text, total_marks,
+		       actual_marks, admin_suggestions, status, created_at
 		FROM mentor.answer_papers
 		WHERE 1=1
 	`
@@ -2112,17 +1764,16 @@ func getAnswerPapers(c *gin.Context) {
 		query += fmt.Sprintf(" AND teacher_id = $%d", argCount)
 		args = append(args, teacherID)
 	}
-	if studentName != "" {
+	if status != "" {
 		argCount++
-		query += fmt.Sprintf(" AND student_name ILIKE $%d", argCount)
-		args = append(args, "%"+studentName+"%")
+		query += fmt.Sprintf(" AND status = $%d", argCount)
+		args = append(args, status)
 	}
 
-	query += " ORDER BY created_at DESC LIMIT 50"
+	query += " ORDER BY created_at DESC LIMIT 100"
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		// Table might not exist yet
 		c.JSON(http.StatusOK, gin.H{"success": true, "papers": []interface{}{}})
 		return
 	}
@@ -2131,26 +1782,39 @@ func getAnswerPapers(c *gin.Context) {
 	var papers []map[string]interface{}
 	for rows.Next() {
 		var id, subscriptionID, chapterNumber int
-		var teacherID, studentName, className, subject, chapterName, notes string
+		var totalMarks, actualMarks sql.NullInt64
+		var teacherID, studentName, className, subject, chapterName, status string
+		var imageURLs, questionText, adminSuggestions sql.NullString
 		var createdAt time.Time
 
 		err := rows.Scan(&id, &subscriptionID, &teacherID, &studentName, &className, &subject,
-			&chapterNumber, &chapterName, &notes, &createdAt)
+			&chapterNumber, &chapterName, &imageURLs, &questionText, &totalMarks,
+			&actualMarks, &adminSuggestions, &status, &createdAt)
 		if err != nil {
 			continue
 		}
 
+		var urls []string
+		if imageURLs.Valid {
+			json.Unmarshal([]byte(imageURLs.String), &urls)
+		}
+
 		papers = append(papers, map[string]interface{}{
-			"id":             id,
-			"subscription_id": subscriptionID,
-			"teacher_id":     teacherID,
-			"student_name":   studentName,
-			"class_name":     className,
-			"subject":        subject,
-			"chapter_number": chapterNumber,
-			"chapter_name":   chapterName,
-			"notes":          notes,
-			"created_at":     createdAt.Format("2006-01-02 15:04:05"),
+			"id":                id,
+			"subscription_id":   subscriptionID,
+			"teacher_id":        teacherID,
+			"student_name":      studentName,
+			"class_name":        className,
+			"subject":           subject,
+			"chapter_number":    chapterNumber,
+			"chapter_name":      chapterName,
+			"image_urls":        urls,
+			"question_text":     questionText.String,
+			"total_marks":       totalMarks.Int64,
+			"actual_marks":      actualMarks.Int64,
+			"admin_suggestions": adminSuggestions.String,
+			"status":            status,
+			"created_at":        createdAt.Format("2006-01-02 15:04:05"),
 		})
 	}
 
@@ -2160,3 +1824,224 @@ func getAnswerPapers(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "papers": papers})
 }
+
+// getAnswerPaper - Get single answer paper by ID
+func getAnswerPaper(c *gin.Context) {
+	id := c.Param("id")
+
+	var paperID, subscriptionID, chapterNumber int
+	var totalMarks, actualMarks sql.NullInt64
+	var teacherID, studentName, className, subject, chapterName, status string
+	var imageURLs, questionText, adminSuggestions sql.NullString
+	var createdAt time.Time
+
+	err := db.QueryRow(`
+		SELECT id, subscription_id, teacher_id, student_name, class_name, subject, 
+		       chapter_number, chapter_name, image_urls, question_text, total_marks,
+		       actual_marks, admin_suggestions, status, created_at
+		FROM mentor.answer_papers
+		WHERE id = $1
+	`, id).Scan(&paperID, &subscriptionID, &teacherID, &studentName, &className, &subject,
+		&chapterNumber, &chapterName, &imageURLs, &questionText, &totalMarks,
+		&actualMarks, &adminSuggestions, &status, &createdAt)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Paper not found"})
+		return
+	}
+
+	var urls []string
+	if imageURLs.Valid {
+		json.Unmarshal([]byte(imageURLs.String), &urls)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"paper": map[string]interface{}{
+			"id":                paperID,
+			"subscription_id":   subscriptionID,
+			"teacher_id":        teacherID,
+			"student_name":      studentName,
+			"class_name":        className,
+			"subject":           subject,
+			"chapter_number":    chapterNumber,
+			"chapter_name":      chapterName,
+			"image_urls":        urls,
+			"question_text":     questionText.String,
+			"total_marks":       totalMarks.Int64,
+			"actual_marks":      actualMarks.Int64,
+			"admin_suggestions": adminSuggestions.String,
+			"status":            status,
+			"created_at":        createdAt.Format("2006-01-02 15:04:05"),
+		},
+	})
+}
+
+// getGradingQueue - Get papers pending grading (for admin)
+func getGradingQueue(c *gin.Context) {
+	status := c.DefaultQuery("status", "pending")
+
+	rows, err := db.Query(`
+		SELECT id, subscription_id, teacher_id, student_name, class_name, subject, 
+		       chapter_number, chapter_name, image_urls, question_text, total_marks,
+		       actual_marks, admin_suggestions, status, created_at
+		FROM mentor.answer_papers
+		WHERE status = $1
+		ORDER BY created_at DESC
+		LIMIT 100
+	`, status)
+
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": true, "papers": []interface{}{}})
+		return
+	}
+	defer rows.Close()
+
+	var papers []map[string]interface{}
+	for rows.Next() {
+		var id, subscriptionID, chapterNumber int
+		var totalMarks, actualMarks sql.NullInt64
+		var teacherID, studentName, className, subject, chapterName, status string
+		var imageURLs, questionText, adminSuggestions sql.NullString
+		var createdAt time.Time
+
+		err := rows.Scan(&id, &subscriptionID, &teacherID, &studentName, &className, &subject,
+			&chapterNumber, &chapterName, &imageURLs, &questionText, &totalMarks,
+			&actualMarks, &adminSuggestions, &status, &createdAt)
+		if err != nil {
+			continue
+		}
+
+		var urls []string
+		if imageURLs.Valid {
+			json.Unmarshal([]byte(imageURLs.String), &urls)
+		}
+
+		papers = append(papers, map[string]interface{}{
+			"id":                id,
+			"subscription_id":   subscriptionID,
+			"teacher_id":        teacherID,
+			"student_name":      studentName,
+			"class_name":        className,
+			"subject":           subject,
+			"chapter_number":    chapterNumber,
+			"chapter_name":      chapterName,
+			"image_urls":        urls,
+			"question_text":     questionText.String,
+			"total_marks":       totalMarks.Int64,
+			"actual_marks":      actualMarks.Int64,
+			"admin_suggestions": adminSuggestions.String,
+			"status":            status,
+			"created_at":        createdAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	if papers == nil {
+		papers = []map[string]interface{}{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "papers": papers})
+}
+
+// saveGrade - Admin saves grade for an answer paper
+func saveGrade(c *gin.Context) {
+	id := c.Param("id")
+
+	var input struct {
+		QuestionText     string `json:"question_text"`
+		TotalMarks       int    `json:"total_marks"`
+		ActualMarks      int    `json:"actual_marks"`
+		AdminSuggestions string `json:"admin_suggestions"`
+		GradedBy         string `json:"graded_by"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	_, err := db.Exec(`
+		UPDATE mentor.answer_papers 
+		SET question_text = $1, total_marks = $2, actual_marks = $3, 
+		    admin_suggestions = $4, graded_by = $5, status = 'graded', graded_at = NOW()
+		WHERE id = $6
+	`, input.QuestionText, input.TotalMarks, input.ActualMarks,
+		input.AdminSuggestions, input.GradedBy, id)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Grade saved"})
+}
+
+// getTeacherGrades - Get grading history for a teacher's students
+func getTeacherGrades(c *gin.Context) {
+	teacherID := c.Param("teacherId")
+	studentName := c.Query("student_name")
+
+	query := `
+		SELECT id, student_name, class_name, subject, chapter_name, 
+		       total_marks, actual_marks, admin_suggestions, graded_at, created_at
+		FROM mentor.answer_papers
+		WHERE teacher_id = $1 AND status = 'graded'
+	`
+	args := []interface{}{teacherID}
+	argNum := 2
+
+	if studentName != "" {
+		query += fmt.Sprintf(" AND student_name ILIKE $%d", argNum)
+		args = append(args, "%"+studentName+"%")
+	}
+
+	query += " ORDER BY graded_at DESC LIMIT 100"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": true, "grades": []interface{}{}})
+		return
+	}
+	defer rows.Close()
+
+	var grades []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var totalMarks, actualMarks sql.NullInt64
+		var studentName, className, subject, chapterName string
+		var adminSuggestions sql.NullString
+		var gradedAt sql.NullTime
+		var createdAt time.Time
+
+		err := rows.Scan(&id, &studentName, &className, &subject, &chapterName,
+			&totalMarks, &actualMarks, &adminSuggestions, &gradedAt, &createdAt)
+		if err != nil {
+			continue
+		}
+
+		gradedAtStr := ""
+		if gradedAt.Valid {
+			gradedAtStr = gradedAt.Time.Format("2006-01-02 15:04:05")
+		}
+
+		grades = append(grades, map[string]interface{}{
+			"id":                id,
+			"student_name":      studentName,
+			"class_name":        className,
+			"subject":           subject,
+			"chapter_name":      chapterName,
+			"total_marks":       totalMarks.Int64,
+			"actual_marks":      actualMarks.Int64,
+			"admin_suggestions": adminSuggestions.String,
+			"graded_at":         gradedAtStr,
+			"submitted_at":      createdAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	if grades == nil {
+		grades = []map[string]interface{}{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "grades": grades})
+}
+
